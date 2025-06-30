@@ -1,97 +1,81 @@
-"""
-app.py
-
-This is the main entry point for your Codebase Assistant.
-It uses:
-- AST-aware chunking with docstrings to split code into meaningful blocks
-- Chroma vector store for retrieval
-- HuggingFace MiniLM embeddings
-- Groq's Mixtral model as the LLM
-- Gradio UI for chatting with your codebase
-
-Author: Your Name
-"""
-
 import gradio as gr
 from langchain.chains import RetrievalQA
-from langchain.llms import Groq
+from langchain_groq import ChatGroq
 from langchain.vectorstores import Chroma
 from langchain.embeddings import HuggingFaceEmbeddings
+from dotenv import load_dotenv
 import os
-
+import shutil
+import tempfile
 from ast_chunker import ASTCodeChunker
+from git import Repo
 
-def load_code_documents(directory="codebase"):
-    """
-    Loads and chunks all .py files in the given directory using ASTCodeChunker.
+load_dotenv()
+api_key = os.getenv("GROQ_API_KEY")
 
-    Returns:
-        list of Document: The parsed and chunked documents ready for embedding.
-    """
+def load_code_documents(directory):
     chunker = ASTCodeChunker()
     all_docs = []
-
-    # Iterate over all Python files in the directory
-    for file_name in os.listdir(directory):
-        if file_name.endswith(".py"):
-            path = os.path.join(directory, file_name)
-            with open(path, "r") as f:
-                code = f.read()
-
-            # Use AST chunker to split code into logical chunks with docstrings
-            docs = chunker.chunk_code(code, file_path=path)
-            all_docs.extend(docs)
+    for root, _, files in os.walk(directory):
+        for file_name in files:
+            if file_name.endswith(".py"):
+                path = os.path.join(root, file_name)
+                with open(path, "r", encoding="utf-8") as f:
+                    code = f.read()
+                docs = chunker.chunk_code(code, file_path=path)
+                all_docs.extend(docs)
     return all_docs
 
-def create_vectorstore(docs):
-    """
-    Creates a Chroma vector store from given documents.
-    Persists embeddings locally in the 'db' folder.
-    """
+def create_vectorstore(docs, persist_directory):
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    vectorstore = Chroma.from_documents(docs, embedding=embeddings, persist_directory="db")
+    vectorstore = Chroma.from_documents(docs, embedding=embeddings, persist_directory=persist_directory)
     return vectorstore
 
-def get_retriever():
-    """
-    Loads the persisted vector store and returns a retriever
-    using MMR (Maximal Marginal Relevance) for multi-hop-style diverse retrieval.
-    """
+def get_retriever(persist_directory):
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    vectorstore = Chroma(persist_directory="db", embedding_function=embeddings)
+    vectorstore = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
     return vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 5, "fetch_k": 10})
 
-def setup_chain():
-    """
-    Sets up the RetrievalQA chain using Groq's Mixtral model.
-    """
-    retriever = get_retriever()
-    llm = Groq(model="mixtral-8x7b-32768", api_key="your-groq-api-key")
+def setup_chain(persist_directory):
+    retriever = get_retriever(persist_directory)
+    llm = ChatGroq(model_name="llama-3.1-8b-instant", api_key=api_key)
     return RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
 
-# Build the vector store once if it doesn't exist
-if not os.path.exists("db/index"):
-    docs = load_code_documents()
-    create_vectorstore(docs)
+def prepare_codebase(repo_url):
+    temp_dir = tempfile.mkdtemp()
+    try:
+        Repo.clone_from(repo_url, temp_dir)
+        docs = load_code_documents(temp_dir)
+        db_dir = os.path.join(temp_dir, "db")
+        create_vectorstore(docs, db_dir)
+        return db_dir, temp_dir
+    except Exception as e:
+        shutil.rmtree(temp_dir)
+        raise e
 
-# Create the RetrievalQA chain for answering questions
-qa_chain = setup_chain()
+def chat_with_repo(history, repo_url, message):
+    if not repo_url or not repo_url.strip():
+        return history + [[message, "Please provide a valid GitHub repository URL."]]
+    try:
+        db_dir, temp_dir = prepare_codebase(repo_url)
+        qa_chain = setup_chain(db_dir)
+        answer = qa_chain.run(message)
+        shutil.rmtree(temp_dir)
+        return history + [[message, answer]]
+    except Exception as e:
+        return history + [[message, f"Error: {str(e)}"]]
 
-def chat_with_codebase(question):
-    """
-    Given a user question, retrieves relevant code chunks and generates an answer.
-    """
-    return qa_chain.run(question)
+with gr.Blocks() as demo:
+    gr.Markdown("# Codebase Assistant: Chat with any GitHub repo")
+    repo_url = gr.Textbox(label="GitHub Repository URL", placeholder="https://github.com/user/repo")
+    chatbot = gr.Chatbot()
+    msg = gr.Textbox(label="Your question")
+    state = gr.State([])
 
-# Launch Gradio Chatbot UI
-gr.Interface(
-    fn=chat_with_codebase,
-    inputs="text",
-    outputs="text",
-    title="Codebase Assistant with AST + Docstrings + Multi-hop Retrieval",
-    description=(
-        "Ask questions about your codebase. "
-        "This assistant uses AST parsing with docstrings for better chunking, "
-        "HuggingFace embeddings, Chroma vector store with MMR retrieval, and Groq's Mixtral LLM."
-    )
-).launch()
+    def respond(history, repo_url, message):
+        return chat_with_repo(history, repo_url, message), repo_url, ""
+
+    msg.submit(respond, [state, repo_url, msg], [chatbot, repo_url, msg], queue=False)
+    chatbot.style(height=400)
+
+demo.launch()
