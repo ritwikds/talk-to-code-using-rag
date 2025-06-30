@@ -65,3 +65,4 @@ class ASTCodeChunker:
                 # Add as a Document with metadata
                 chunks.append(Document(page_content=combined, metadata={"file_path": file_path}))
         return chunks
+
